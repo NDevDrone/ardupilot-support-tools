@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import shutil
 import struct
 from collections import defaultdict
 from pathlib import Path
@@ -27,6 +28,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w", type=int, default=84, help="Output width in chars")
     p.add_argument("--h", type=int, default=28, help="Output height in chars")
     p.add_argument("--mode", choices=["both", "height", "shade"], default="both")
+    p.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Interactive pan mode (arrow keys move view, q quits)",
+    )
+    p.add_argument(
+        "--fit-terminal",
+        action="store_true",
+        help="Clamp render width so ASCII rows fit current terminal width",
+    )
+    p.add_argument(
+        "--frame",
+        action="store_true",
+        help="Draw |...| frame around rows to make width and trailing spaces visible",
+    )
     return p.parse_args()
 
 
@@ -162,13 +178,118 @@ def hillshade(matrix):
     return out
 
 
+def effective_width(requested_w: int, fit_terminal: bool, frame: bool) -> int:
+    if not fit_terminal:
+        return max(1, requested_w)
+    cols = shutil.get_terminal_size(fallback=(120, 40)).columns
+    reserve = 2 if frame else 0
+    max_w = max(8, cols - reserve)
+    return max(1, min(requested_w, max_w))
+
+
+def emit_ascii_block(lines: list[str], width: int, frame: bool) -> None:
+    if frame:
+        print("+" + ("-" * width) + "+")
+    for line in lines:
+        padded = (line[:width]).ljust(width)
+        if frame:
+            print("|" + padded + "|")
+        else:
+            print(padded)
+    if frame:
+        print("+" + ("-" * width) + "+")
+
+
+def run_interactive(lines: list[str], title: str) -> None:
+    import curses
+
+    if not lines:
+        return
+
+    map_h = len(lines)
+    map_w = max(len(ln) for ln in lines)
+    padded = [ln.ljust(map_w) for ln in lines]
+
+    def ui(stdscr):
+        y_off = 0
+        x_off = 0
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+
+        while True:
+            stdscr.erase()
+            max_y, max_x = stdscr.getmaxyx()
+            view_w = max(8, max_x - 2)
+            view_h = max(4, max_y - 4)
+            max_x_off = max(0, map_w - view_w)
+            max_y_off = max(0, map_h - view_h)
+            x_off = max(0, min(x_off, max_x_off))
+            y_off = max(0, min(y_off, max_y_off))
+
+            header = (
+                f"{title} | map {map_w}x{map_h} | view {view_w}x{view_h} | "
+                f"off x={x_off}/{max_x_off} y={y_off}/{max_y_off}"
+            )
+            stdscr.addnstr(0, 0, header, max_x - 1)
+            stdscr.addnstr(1, 0, "+" + ("-" * view_w) + "+", max_x - 1)
+            for row in range(view_h):
+                src_row = y_off + row
+                line = padded[src_row][x_off : x_off + view_w] if src_row < map_h else " " * view_w
+                stdscr.addnstr(2 + row, 0, "|" + line.ljust(view_w) + "|", max_x - 1)
+            stdscr.addnstr(2 + view_h, 0, "+" + ("-" * view_w) + "+", max_x - 1)
+            stdscr.addnstr(
+                3 + view_h,
+                0,
+                "Arrows pan | h/j/k/l pan | H/J/K/L fast pan | q quit",
+                max_x - 1,
+            )
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                break
+            if key in (curses.KEY_LEFT, ord("h")):
+                x_off -= 1
+            elif key in (curses.KEY_RIGHT, ord("l")):
+                x_off += 1
+            elif key in (curses.KEY_UP, ord("k")):
+                y_off -= 1
+            elif key in (curses.KEY_DOWN, ord("j")):
+                y_off += 1
+            elif key == ord("H"):
+                x_off -= 8
+            elif key == ord("L"):
+                x_off += 8
+            elif key == ord("K"):
+                y_off -= 4
+            elif key == ord("J"):
+                y_off += 4
+
+    curses.wrapper(ui)
+
+
 def main() -> int:
     a = parse_args()
     dat_path = Path(a.dat).expanduser().resolve()
     data = dat_path.read_bytes()
     grid, spacing, blocks = build_height_grid(data)
 
-    sampled = resize_nearest(grid, a.h, a.w)
+    if a.interactive:
+        sampled = resize_nearest(grid, a.h, a.w)
+        if a.mode == "shade":
+            lines = map_to_ascii(hillshade(sampled), RAMP_SHADE, robust=False)
+            title = f"{dat_path.name} shade {len(sampled[0])}x{len(sampled)}"
+        else:
+            lines = map_to_ascii(sampled, RAMP_HEIGHT, robust=True)
+            title = f"{dat_path.name} height {len(sampled[0])}x{len(sampled)}"
+        run_interactive(lines, title)
+        return 0
+
+    out_w = effective_width(a.w, a.fit_terminal, a.frame)
+    sampled = resize_nearest(grid, a.h, out_w)
     flat = [v for row in sampled for v in row]
     print(f"file={dat_path.name} spacing={spacing}m blocks={blocks}")
     print(f"grid_points={len(grid)}x{len(grid[0])} render={len(sampled)}x{len(sampled[0])}")
@@ -177,15 +298,13 @@ def main() -> int:
 
     if a.mode in ("both", "height"):
         print("HEIGHT (low=' ' high='@'):")
-        for line in map_to_ascii(sampled, RAMP_HEIGHT, robust=True):
-            print(line)
+        emit_ascii_block(map_to_ascii(sampled, RAMP_HEIGHT, robust=True), out_w, a.frame)
         print()
 
     if a.mode in ("both", "shade"):
         print("HILLSHADE (shape emphasis):")
         shaded = hillshade(sampled)
-        for line in map_to_ascii(shaded, RAMP_SHADE, robust=False):
-            print(line)
+        emit_ascii_block(map_to_ascii(shaded, RAMP_SHADE, robust=False), out_w, a.frame)
     return 0
 
 
